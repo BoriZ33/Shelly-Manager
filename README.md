@@ -2,6 +2,7 @@
 
 A lightweight Python web application that automatically discovers and manages **Shelly smart home devices** (Gen1, Gen2, and Gen3) on your local network.
 
+![Version](https://img.shields.io/badge/Version-1.0-brightgreen)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![Flask](https://img.shields.io/badge/Flask-2.3%2B-lightgrey)
 ![License](https://img.shields.io/badge/License-MIT-green)
@@ -204,6 +205,22 @@ Shelly-Manager/
 - Devices protected by a **password** (HTTP Digest Auth) are marked with a 🔒 badge. Authentication support can be added if needed.
 - The scanner uses 50 parallel threads — scanning a /24 network typically takes 5–15 seconds.
 - `shelly_settings.json` is excluded from git to avoid committing schedule configs.
+
+---
+
+## Changelog
+
+### v1.0 — Initial Release
+- Network scan via IP sweep (50 threads) and optional mDNS discovery
+- Firmware update: per device, update all, live status indicator
+- WiFi credential change: single device, selection, or all devices
+- Device reboot: per device and global
+- Auto-Restart scheduler: Daily or specific weekday + time
+- Auto-Update scheduler: Daily or specific weekday + time
+- Dark / Light theme (persisted in browser)
+- German / English language (persisted in browser)
+- Settings saved to `shelly_settings.json`
+- Windows batch launcher + Linux `start.sh` with automatic virtualenv
 
 ---
 
