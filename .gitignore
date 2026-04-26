@@ -1,6 +1,9 @@
 # Settings (may contain schedules/configs)
 shelly_settings.json
 
+# Virtual environment
+.venv/
+
 # Python
 __pycache__/
 *.py[cod]

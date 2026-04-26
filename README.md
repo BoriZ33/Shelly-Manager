@@ -62,39 +62,89 @@ zeroconf>=0.131   # optional — enables faster mDNS discovery
 
 ---
 
-## Installation
+## Installation & Usage
 
-```bash
-# Clone the repository
-git clone https://github.com/BoriZ33/Shelly-Manager.git
-cd Shelly-Manager
-
-# Install dependencies
-pip install flask requests
-pip install zeroconf        # optional but recommended
-```
-
----
-
-## Usage
-
-### Windows (recommended)
+### Windows
 Double-click **`Start Shelly Manager.bat`** — it will:
 1. Check that Python is installed
 2. Install missing packages automatically
 3. Start the server
 4. Open `http://localhost:5000` in your browser automatically
 
-### Manual start
+### Linux / macOS (including Debian/Ubuntu servers)
+
+> Modern Debian/Ubuntu systems block system-wide `pip install` (PEP 668).  
+> The start script handles this automatically using a **virtual environment**.
+
 ```bash
-python shelly_manager.py
-# or on Windows:
-py shelly_manager.py
+# Clone the repository
+git clone https://github.com/BoriZ33/Shelly-Manager.git
+cd Shelly-Manager
+
+# Make the start script executable (only needed once)
+chmod +x start.sh
+
+# Start — creates venv and installs dependencies automatically
+./start.sh
 ```
 
-Then open **http://localhost:5000** in your browser.
+The server is then available at `http://<server-ip>:5000`.
 
-> Keep the terminal window open — closing it stops the server.
+#### Run as a background service (optional)
+
+```bash
+# Keep running after logout with nohup
+nohup ./start.sh > shelly.log 2>&1 &
+echo "PID: $!"
+
+# Or use screen
+screen -S shelly
+./start.sh
+# Detach: Ctrl+A then D
+```
+
+#### Run as a systemd service (auto-start on boot)
+
+```bash
+sudo nano /etc/systemd/system/shelly-manager.service
+```
+
+Paste:
+
+```ini
+[Unit]
+Description=Shelly Network Manager
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USER
+WorkingDirectory=/path/to/Shelly-Manager
+ExecStart=/path/to/Shelly-Manager/.venv/bin/python shelly_manager.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable shelly-manager
+sudo systemctl start shelly-manager
+sudo systemctl status shelly-manager
+```
+
+### Manual start (any OS)
+```bash
+python3 -m venv .venv
+source .venv/bin/activate        # Linux/macOS
+# .venv\Scripts\activate         # Windows
+pip install flask requests zeroconf
+python shelly_manager.py
+```
+
+> Keep the terminal open — closing it stops the server (unless running as a service).
 
 ---
 
