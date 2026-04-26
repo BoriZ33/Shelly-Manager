@@ -66,14 +66,33 @@ except ImportError:
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shelly_settings.json")
 
 settings: dict = {
-    "auto_restart_enabled": False,  # bool
-    "auto_restart_time":    "03:00", # "HH:MM"
-    "auto_update_enabled":  False,  # bool
-    "auto_update_hours":    24,      # int hours
-    # internal timestamps (not persisted)
-    "_last_restart_day":    None,
-    "_last_auto_update":    0.0,
+    "auto_restart_enabled": False,    # bool
+    "auto_restart_day":     "daily",  # "daily" | "monday" … "sunday"
+    "auto_restart_time":    "03:00",  # "HH:MM"
+    "auto_update_enabled":  False,    # bool
+    "auto_update_day":      "daily",  # "daily" | "monday" … "sunday"
+    "auto_update_time":     "04:00",  # "HH:MM"
+    # internal — not persisted
+    "_last_restart_key":    None,
+    "_last_update_key":     None,
 }
+
+# weekday name → Python weekday number (Monday=0)
+DAY_MAP = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+
+
+def _fire_key(now: datetime.datetime, day: str) -> Optional[str]:
+    """Return a unique string for the current schedule period, or None if not the right day."""
+    if day == "daily":
+        return now.strftime("%Y-%m-%d")
+    target = DAY_MAP.get(day)
+    if target is None or now.weekday() != target:
+        return None  # not the right weekday
+    iso = now.isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}-{day}"
 settings_lock = threading.Lock()
 
 
@@ -422,43 +441,56 @@ def scheduler_loop():
 
             with settings_lock:
                 restart_en   = settings["auto_restart_enabled"]
+                restart_day  = settings["auto_restart_day"]
                 restart_time = settings["auto_restart_time"]
                 update_en    = settings["auto_update_enabled"]
-                update_hours = int(settings["auto_update_hours"])
-                last_restart_day  = settings["_last_restart_day"]
-                last_auto_update  = settings["_last_auto_update"]
+                update_day   = settings["auto_update_day"]
+                update_time  = settings["auto_update_time"]
+                last_restart = settings["_last_restart_key"]
+                last_update  = settings["_last_update_key"]
 
             # ── Auto restart ────────────────────────────────────────────────────
             if restart_en and restart_time and ":" in restart_time:
                 try:
                     h, m = map(int, restart_time.split(":"))
-                    today = now.date()
-                    if now.hour == h and now.minute == m and today != last_restart_day:
-                        with settings_lock:
-                            settings["_last_restart_day"] = today
-                        with devices_lock:
-                            ips = list(devices.keys())
-                        logger.info(f"Auto-restart: rebooting {len(ips)} device(s) at {restart_time}")
-                        for ip in ips:
-                            result = action_reboot(ip)
-                            logger.info(f"  Reboot {ip}: {result}")
+                    if now.hour == h and now.minute == m:
+                        key = _fire_key(now, restart_day)
+                        if key and key != last_restart:
+                            with settings_lock:
+                                settings["_last_restart_key"] = key
+                            with devices_lock:
+                                ips = list(devices.keys())
+                            logger.info(
+                                f"Auto-restart [{restart_day} {restart_time}]: "
+                                f"rebooting {len(ips)} device(s)"
+                            )
+                            for ip in ips:
+                                logger.info(f"  Reboot {ip}: {action_reboot(ip)}")
                 except (ValueError, AttributeError) as e:
-                    logger.error(f"Auto-restart time parse error: {e}")
+                    logger.error(f"Auto-restart error: {e}")
 
             # ── Auto update ─────────────────────────────────────────────────────
-            if update_en and update_hours > 0:
-                if time.time() - last_auto_update >= update_hours * 3600:
-                    with settings_lock:
-                        settings["_last_auto_update"] = time.time()
-                    with devices_lock:
-                        upd_ips = [ip for ip, d in devices.items() if d.get("has_update")]
-                    if upd_ips:
-                        logger.info(f"Auto-update: updating {len(upd_ips)} device(s)")
-                        for ip in upd_ips:
-                            result = action_update(ip)
-                            logger.info(f"  Update {ip}: {result}")
-                    else:
-                        logger.info("Auto-update: no updates available, skipping.")
+            if update_en and update_time and ":" in update_time:
+                try:
+                    h, m = map(int, update_time.split(":"))
+                    if now.hour == h and now.minute == m:
+                        key = _fire_key(now, update_day)
+                        if key and key != last_update:
+                            with settings_lock:
+                                settings["_last_update_key"] = key
+                            with devices_lock:
+                                upd_ips = [ip for ip, d in devices.items() if d.get("has_update")]
+                            if upd_ips:
+                                logger.info(
+                                    f"Auto-update [{update_day} {update_time}]: "
+                                    f"updating {len(upd_ips)} device(s)"
+                                )
+                                for ip in upd_ips:
+                                    logger.info(f"  Update {ip}: {action_update(ip)}")
+                            else:
+                                logger.info(f"Auto-update [{update_day} {update_time}]: no updates available.")
+                except (ValueError, AttributeError) as e:
+                    logger.error(f"Auto-update error: {e}")
 
         except Exception as e:
             logger.error(f"Scheduler error: {e}")
@@ -556,47 +588,49 @@ def api_reboot_all():
     return jsonify({"results": results, "count": len(ips)})
 
 
+def _validate_time(val: str) -> Optional[str]:
+    """Validate and normalise a HH:MM string. Returns None on failure."""
+    try:
+        h, m = map(int, str(val).strip().split(":"))
+        if 0 <= h <= 23 and 0 <= m <= 59:
+            return f"{h:02d}:{m:02d}"
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+
+def _validate_day(val: str) -> Optional[str]:
+    """Validate a day string. Returns None on failure."""
+    v = str(val).strip().lower()
+    if v == "daily" or v in DAY_MAP:
+        return v
+    return None
+
+
 @app.route("/api/settings", methods=["GET"])
 def api_get_settings():
     with settings_lock:
         data = {k: v for k, v in settings.items() if not k.startswith("_")}
-    # Compute next auto-update timestamp for UI display
-    with settings_lock:
-        last_upd = settings["_last_auto_update"]
-        upd_hours = int(settings["auto_update_hours"])
-        upd_en = settings["auto_update_enabled"]
-    if upd_en and upd_hours > 0 and last_upd > 0:
-        next_ts = last_upd + upd_hours * 3600
-        data["_next_auto_update"] = datetime.datetime.fromtimestamp(next_ts).strftime("%d.%m.%Y %H:%M")
-    elif upd_en and upd_hours > 0:
-        data["_next_auto_update"] = "—"
-    else:
-        data["_next_auto_update"] = None
     return jsonify(data)
 
 
 @app.route("/api/settings", methods=["POST"])
 def api_post_settings():
-    data = request.get_json() or {}
+    body = request.get_json() or {}
     with settings_lock:
-        if "auto_restart_enabled" in data:
-            settings["auto_restart_enabled"] = bool(data["auto_restart_enabled"])
-        if "auto_restart_time" in data:
-            t_val = str(data["auto_restart_time"]).strip()
-            # Validate HH:MM format
-            try:
-                h, m = map(int, t_val.split(":"))
-                if 0 <= h <= 23 and 0 <= m <= 59:
-                    settings["auto_restart_time"] = f"{h:02d}:{m:02d}"
-            except (ValueError, AttributeError):
-                pass
-        if "auto_update_enabled" in data:
-            settings["auto_update_enabled"] = bool(data["auto_update_enabled"])
-        if "auto_update_hours" in data:
-            try:
-                settings["auto_update_hours"] = max(1, int(data["auto_update_hours"]))
-            except (ValueError, TypeError):
-                pass
+        for field in ("auto_restart_enabled", "auto_update_enabled"):
+            if field in body:
+                settings[field] = bool(body[field])
+        for field in ("auto_restart_day", "auto_update_day"):
+            if field in body:
+                v = _validate_day(body[field])
+                if v:
+                    settings[field] = v
+        for field in ("auto_restart_time", "auto_update_time"):
+            if field in body:
+                v = _validate_time(body[field])
+                if v:
+                    settings[field] = v
     save_settings()
     return jsonify({"success": True})
 
@@ -929,29 +963,32 @@ input[type=checkbox] { accent-color: var(--accent); width: 14px; height: 14px; c
 .settings-block-title { font-weight: 600; font-size: .9rem; margin-bottom: 3px; }
 .settings-block-desc  { font-size: .76rem; color: var(--dim); line-height: 1.4; }
 
-.settings-row {
+.settings-fields {
+  display: flex; gap: 12px; flex-wrap: wrap; margin-top: 4px;
+}
+.settings-field-group {
   display: flex; flex-direction: column; gap: 5px;
 }
-.settings-row label { font-size: .8rem; color: var(--dim); font-weight: 500; }
-.settings-row input[type=time],
-.settings-row input[type=number] {
+.settings-field-group label { font-size: .8rem; color: var(--dim); font-weight: 500; }
+
+.settings-select,
+.settings-fields input[type=time] {
   padding: 7px 10px;
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 7px;
   color: var(--text);
-  font-size: .9rem;
+  font-size: .88rem;
   outline: none;
-  width: 100%;
-  max-width: 160px;
   transition: border-color .15s;
+  cursor: pointer;
 }
-.settings-row input:focus { border-color: var(--accent); }
-.settings-row input:disabled { opacity: .4; cursor: not-allowed; }
-
-.settings-next {
-  font-size: .76rem; color: var(--dim); margin-top: 4px;
-}
+.settings-select { min-width: 130px; }
+.settings-fields input[type=time] { width: 120px; }
+.settings-select:focus,
+.settings-fields input[type=time]:focus { border-color: var(--accent); }
+.settings-select:disabled,
+.settings-fields input:disabled { opacity: .4; cursor: not-allowed; }
 
 .settings-footer {
   margin-top: 14px;
@@ -1088,12 +1125,18 @@ input[type=checkbox] { accent-color: var(--accent); width: 14px; height: 14px; c
             </label>
             <div>
               <div class="settings-block-title" data-i18n="settingsRestart">Auto-Neustart</div>
-              <div class="settings-block-desc" data-i18n="settingsRestartDesc">Alle Geräte täglich zur eingestellten Zeit neu starten</div>
+              <div class="settings-block-desc" data-i18n="settingsRestartDesc">Alle Geräte zum eingestellten Zeitpunkt neu starten</div>
             </div>
           </div>
-          <div class="settings-row" id="s-restart-row">
-            <label data-i18n="settingsRestartAt">Uhrzeit</label>
-            <input type="time" id="s-restart-time" value="03:00">
+          <div class="settings-fields" id="s-restart-row">
+            <div class="settings-field-group">
+              <label data-i18n="settingsDay">Wochentag</label>
+              <select id="s-restart-day" class="settings-select"></select>
+            </div>
+            <div class="settings-field-group">
+              <label data-i18n="settingsTime">Uhrzeit</label>
+              <input type="time" id="s-restart-time" value="03:00">
+            </div>
           </div>
         </div>
 
@@ -1109,13 +1152,15 @@ input[type=checkbox] { accent-color: var(--accent); width: 14px; height: 14px; c
               <div class="settings-block-desc" data-i18n="settingsUpdateDesc">Geräte automatisch aktualisieren wenn ein Update verfügbar ist</div>
             </div>
           </div>
-          <div class="settings-row" id="s-update-row">
-            <label data-i18n="settingsInterval">Intervall (Stunden)</label>
-            <div style="display:flex;align-items:center;gap:8px">
-              <input type="number" id="s-update-hours" min="1" max="720" value="24" style="width:80px">
-              <span style="color:var(--dim);font-size:.8rem">h</span>
+          <div class="settings-fields" id="s-update-row">
+            <div class="settings-field-group">
+              <label data-i18n="settingsDay">Wochentag</label>
+              <select id="s-update-day" class="settings-select"></select>
             </div>
-            <div class="settings-next" id="s-next-update"></div>
+            <div class="settings-field-group">
+              <label data-i18n="settingsTime">Uhrzeit</label>
+              <input type="time" id="s-update-time" value="04:00">
+            </div>
           </div>
         </div>
 
@@ -1219,17 +1264,23 @@ const STRINGS = {
     // settings
     settingsTitle:       'Einstellungen',
     settingsRestart:     'Auto-Neustart',
-    settingsRestartDesc: 'Alle Geräte täglich zur eingestellten Zeit neu starten',
-    settingsRestartAt:   'Uhrzeit',
+    settingsRestartDesc: 'Alle Geräte zum eingestellten Zeitpunkt neu starten',
     settingsUpdate:      'Auto-Update',
     settingsUpdateDesc:  'Geräte automatisch aktualisieren wenn ein Update verfügbar ist',
-    settingsInterval:    'Intervall (Stunden)',
+    settingsDay:         'Wochentag',
+    settingsTime:        'Uhrzeit',
     settingsSave:        'Speichern',
-    settingsDisabled:    '0 = deaktiviert',
-    settingsNextUpdate:  'Nächstes Update',
-    settingsLastUpdate:  'Letztes Update',
-    settingsNever:       'Noch nie',
     settingsSaved:       'Einstellungen gespeichert',
+    days: {
+      daily:     'Täglich',
+      monday:    'Montag',
+      tuesday:   'Dienstag',
+      wednesday: 'Mittwoch',
+      thursday:  'Donnerstag',
+      friday:    'Freitag',
+      saturday:  'Samstag',
+      sunday:    'Sonntag',
+    },
     // reboot
     btnRebootAll:        'Alle neustarten',
     btnReboot:           '↺ Neustart',
@@ -1288,16 +1339,23 @@ const STRINGS = {
     // settings
     settingsTitle:       'Settings',
     settingsRestart:     'Auto-Restart',
-    settingsRestartDesc: 'Restart all devices daily at the configured time',
-    settingsRestartAt:   'Time',
+    settingsRestartDesc: 'Restart all devices at the configured day and time',
     settingsUpdate:      'Auto-Update',
     settingsUpdateDesc:  'Automatically update devices when an update is available',
-    settingsInterval:    'Interval (hours)',
+    settingsDay:         'Day',
+    settingsTime:        'Time',
     settingsSave:        'Save',
-    settingsDisabled:    '0 = disabled',
-    settingsNextUpdate:  'Next update',
-    settingsNever:       'Never',
     settingsSaved:       'Settings saved',
+    days: {
+      daily:     'Daily',
+      monday:    'Monday',
+      tuesday:   'Tuesday',
+      wednesday: 'Wednesday',
+      thursday:  'Thursday',
+      friday:    'Friday',
+      saturday:  'Saturday',
+      sunday:    'Sunday',
+    },
     // reboot
     btnRebootAll:   'Restart all',
     btnReboot:      '↺ Restart',
@@ -1363,8 +1421,11 @@ function applyLang(l) {
   const ssidInput = $('f-ssid');
   if (ssidInput) ssidInput.placeholder = t('wifiPlSSID');
 
-  // Re-apply settings labels if open
-  if (settingsOpen) loadSettings();
+  // Rebuild day dropdowns with new language
+  if (settingsOpen) {
+    buildDayOptions('s-restart-day', $('s-restart-day').value);
+    buildDayOptions('s-update-day',  $('s-update-day').value);
+  }
 
   // Header controls
   $('lang-label').textContent  = t('langSwitch');
@@ -1651,41 +1712,51 @@ function toggleSettings() {
   if (settingsOpen) loadSettings();
 }
 
+const DAY_KEYS = ['daily','monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
+
+function buildDayOptions(selectId, selectedVal) {
+  const el = $(selectId);
+  if (!el) return;
+  el.innerHTML = DAY_KEYS.map(k =>
+    `<option value="${k}" ${k === selectedVal ? 'selected' : ''}>${t('days')[k]}</option>`
+  ).join('');
+}
+
 function onToggleRestart(on) {
-  $('s-restart-row').style.opacity        = on ? '1' : '0.4';
-  $('s-restart-time').disabled            = !on;
+  $('s-restart-row').style.opacity = on ? '1' : '0.4';
+  $('s-restart-day').disabled  = !on;
+  $('s-restart-time').disabled = !on;
 }
 
 function onToggleUpdate(on) {
-  $('s-update-row').style.opacity         = on ? '1' : '0.4';
-  $('s-update-hours').disabled            = !on;
+  $('s-update-row').style.opacity = on ? '1' : '0.4';
+  $('s-update-day').disabled  = !on;
+  $('s-update-time').disabled = !on;
 }
 
 async function loadSettings() {
   const s = await api('/api/settings');
 
-  $('s-restart-en').checked   = !!s.auto_restart_enabled;
-  $('s-restart-time').value   = s.auto_restart_time || '03:00';
-  $('s-update-en').checked    = !!s.auto_update_enabled;
-  $('s-update-hours').value   = s.auto_update_hours  || 24;
+  $('s-restart-en').checked  = !!s.auto_restart_enabled;
+  $('s-restart-time').value  = s.auto_restart_time || '03:00';
+  $('s-update-en').checked   = !!s.auto_update_enabled;
+  $('s-update-time').value   = s.auto_update_time  || '04:00';
+
+  buildDayOptions('s-restart-day', s.auto_restart_day || 'daily');
+  buildDayOptions('s-update-day',  s.auto_update_day  || 'daily');
 
   onToggleRestart(!!s.auto_restart_enabled);
   onToggleUpdate(!!s.auto_update_enabled);
-
-  const nextEl = $('s-next-update');
-  if (nextEl) {
-    nextEl.textContent = s._next_auto_update
-      ? `${t('settingsNextUpdate')}: ${s._next_auto_update}`
-      : (s.auto_update_enabled ? t('settingsNever') : '');
-  }
 }
 
 async function saveSettings() {
   const payload = {
     auto_restart_enabled: $('s-restart-en').checked,
+    auto_restart_day:     $('s-restart-day').value,
     auto_restart_time:    $('s-restart-time').value,
     auto_update_enabled:  $('s-update-en').checked,
-    auto_update_hours:    parseInt($('s-update-hours').value) || 24,
+    auto_update_day:      $('s-update-day').value,
+    auto_update_time:     $('s-update-time').value,
   };
   const res = await api('/api/settings', 'POST', payload);
   if (res.success) {
